@@ -413,4 +413,4 @@ write.csv(cohort_step2, out_csv, row.names = FALSE)
 
 cat("\n[완료] 코호트 저장 =>", out_csv, "\n")
 cat("코호트 미리보기:\n")
-print(head(cohort, 5))
+print(head(cohort_step2, 5))
