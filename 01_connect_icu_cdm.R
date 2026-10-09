@@ -41,6 +41,7 @@ cat("CDM 스키마:", CDM_SCHEMA, "\n\n")
 
 # Sampled examples of available CDM tables
 cat("사용 가능한 CDM 테이블:\n")
+# information_schema: PostgreSQL 메타데이터 조회 (dbms 의존)
 querySql(conn, sprintf(
   "SELECT table_name FROM information_schema.tables
     WHERE table_schema = '%s' ORDER BY table_name", CDM_SCHEMA)) %>%
@@ -65,7 +66,10 @@ querySql(conn, sprintf(
 cat("\n연결 완료. 다음 단계(02_build_icu_cohort.R)에서 코호트 구축 예정.\n")
 
 
-##### Demo SQL query 1
+##### Demo SQL query 1 (탐색용; 02 의 outcome 정의와 다름)
+# 최초 inpatient 입원 기준 ward→ICU 전원 분류. early = 입원 후 ≤2일 (CXR 기준 아님)
+# 한계: ICU 판정이 이름 패턴(ILIKE)이라 CCU, TSICU 누락,
+#       care_site NULL(ER 등) 유닛은 INNER JOIN 으로 제외
 cohort <- querySql(conn, sprintf(
   "WITH index_admission AS (
    -- 환자별 최초 inpatient 입원 선정 (outpatient-only 환자는 여기서 제외)
@@ -91,6 +95,7 @@ cohort <- querySql(conn, sprintf(
      fa.visit_occurrence_id,
      fa.admission_time,
      vd.visit_detail_start_datetime,
+     -- 패턴 매칭: CCU, TSICU 미포함
      CASE WHEN cs.care_site_name ILIKE '%%intensive care unit%%' THEN 1 ELSE 0 END AS is_icu,
      ROW_NUMBER() OVER (
        PARTITION BY fa.visit_occurrence_id ORDER BY vd.visit_detail_start_datetime
@@ -101,6 +106,7 @@ cohort <- querySql(conn, sprintf(
    FROM first_admission fa
    JOIN %s.visit_detail vd ON fa.visit_occurrence_id = vd.visit_occurrence_id
    JOIN %s.care_site cs    ON vd.care_site_id = cs.care_site_id
+   -- INNER JOIN: care_site_id NULL 유닛 제외 → ER→ICU 가 직접 ICU 입실로 분류될 수 있음
  ),
  direct_icu_admission AS (
    -- 최초 유닛부터 ICU인 환자 -> total에서 제외
@@ -129,6 +135,7 @@ cohort <- querySql(conn, sprintf(
      fa.visit_occurrence_id,
      fa.admission_time,
      ft.icu_transfer_time,
+     -- 입원→ICU 전원 경과일 (초 / 86400)
      EXTRACT(EPOCH FROM (ft.icu_transfer_time - fa.admission_time)) / 86400.0 AS days_to_transfer,
      CASE
        WHEN ft.icu_transfer_time IS NULL THEN 'ward_only'
@@ -148,7 +155,7 @@ cohort <- querySql(conn, sprintf(
 ), integer64AsNumeric = FALSE)
 
 
-##### Demo SQL query 2
+##### Demo SQL query 2: Demo 1 과 동일 CTE, category 별 환자 수 집계
 querySql(conn, sprintf(
   "WITH index_admission AS (
    SELECT
