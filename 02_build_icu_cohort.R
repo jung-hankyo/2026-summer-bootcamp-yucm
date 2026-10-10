@@ -1,10 +1,18 @@
 # =====================================================================
-# 여기에서의 event of interest = 24h 이내 ICU transfer
+# 02_build_icu_cohort.R — 익일 ICU 전원 예측용 코호트 구축
 #
-# OMOP CDM에서 추출하고자 하는 data:
-#   24h 이내 ward -> ICU transfer 여부, CXR local_path, 환자들의 기본 임상 정보(lab data)
-#   icu_cohort.csv (person_id, image_occurrence_id, local_path 등 포함) 형태로 저장
-# 
+# 예측 과제: index CXR 촬영일 다음 날(D+1) ward/ER → ICU 전원 여부 (이진 분류)
+#   outcome = 1 : CXR 촬영일 + 1일에 non-ICU → ICU 전환 발생 (환자당 최초 1건)
+#   outcome = 0 : 전 기간 ward/ER → ICU 전환 이력 없는 환자의 최초 eligible CXR
+#                 (처음부터 ICU로 입실한 환자도 전원 사건이 없으므로 음성)
+#   * 날짜(calendar day) 단위 정의. 전원 당일 및 ICU 재실 중 촬영 CXR 은 제외
+#
+# 구성:
+#   [사전 확인] care_site 분포, ER visit_detail, 동일일 CXR, FK/NULL, ICU 판정 교차검증
+#   [step1] SQL: ICU 판정 → 전원 사건 → eligible CXR → 양성/음성 index CXR (환자당 1행)
+#   [step2] SQL: index CXR 기준 [D-7, D0] 최신 lab 18종 + 인구학 정보 + 영상 경로 결합
+#   [저장]  icu_cohort.csv (person_id, image_occurrence_id, local_path, lab 등)
+#
 # concept 정의 방식: ATLAS(OHDSI) 에서 개념 검색/확정
 #   1) ATLAS Search에서 검색
 #   2) SNOMED standard concept 및 concept_id 선택
@@ -78,13 +86,14 @@ querySql(conn, sprintf(
 
 
 ## Edge case. 같은 admission, 같은 날짜에 CXR이 2개 이상 존재하는 경우 확인
+##   (step1 은 person·날짜 단위로 2장 이상이면 제외)
 querySql(conn, sprintf(
   "SELECT n_cxr_per_day, COUNT(*) AS n_person_visit_day
      FROM (
        SELECT io.person_id, io.visit_occurrence_id, io.image_occurrence_date,
               COUNT(*) AS n_cxr_per_day
          FROM %s.image_occurrence io
-        WHERE io.modality_concept_id IN (2128009197, 2128009189)
+        WHERE io.modality_concept_id IN (2128009197, 2128009189)  -- CXR modality 로컬 concept_id
         GROUP BY io.person_id, io.visit_occurrence_id, io.image_occurrence_date
      ) sub
     GROUP BY n_cxr_per_day
@@ -160,6 +169,9 @@ querySql(conn, sprintf(
 ##### Cohort 구축 (2단계에 걸쳐 SQL query 작성 및 cohort 구성)
 
 ## cohort_step1
+# CTE 흐름: icu_care_sites → vd_flagged → vd_seq → {transfer_events, icu_occupied}
+#           → cxr_daily → cxr_eligible → qualifying_events → positive_cohort
+#                                     → negative_candidates → negative_cohort
 sql <- sprintf(
   "WITH icu_care_sites AS (
    SELECT care_site_id
@@ -182,6 +194,7 @@ sql <- sprintf(
      vd.visit_detail_start_datetime,
      CAST(vd.visit_detail_start_datetime AS DATE) AS vd_start_date,
      CAST(vd.visit_detail_end_datetime   AS DATE) AS vd_end_date,
+     -- care_site_id NULL → IN 결과 NULL → 0 (non-ICU) 처리
      CASE WHEN vd.care_site_id IN (SELECT care_site_id FROM icu_care_sites)
           THEN 1 ELSE 0 END AS is_icu
    FROM %1$s.visit_detail vd
@@ -195,26 +208,27 @@ sql <- sprintf(
    FROM vd_flagged v
  ),
  transfer_events AS (
-   -- 병동/ER -> ICU 전환. admission 첫 유닛이 ICU면 prev_is_icu가 NULL이라 제외함
+   -- 병동/ER -> ICU 전환. 첫 유닛이 ICU(직접 입실)면 prev_is_icu NULL → 전원 사건 아님
    SELECT DISTINCT person_id, vd_start_date AS icu_transfer_date
      FROM vd_seq
     WHERE is_icu = 1 AND prev_is_icu = 0
  ),
  icu_occupied AS (
-   -- ICU 재실 구간. diff=0 케이스는 여기서 제외됨
+   -- ICU 재실 구간(시작일~종료일, 종료 NULL 이면 시작일). 이 기간 CXR 제외 → 전원 당일(D0) CXR 도 제외
    SELECT person_id, vd_start_date,
           COALESCE(vd_end_date, vd_start_date) AS vd_end_filled
      FROM vd_seq
     WHERE is_icu = 1
  ),
  cxr_daily AS (
+   -- 동일 person·날짜 CXR ≥2장 → index 영상 선택이 모호하여 오분류/선택 편향 방지 위해 제외
    SELECT person_id, image_occurrence_id, image_study_uid,
           image_occurrence_date AS cxr_date,
           COUNT(*) OVER (
             PARTITION BY person_id, image_occurrence_date
           ) AS n_same_day
      FROM %1$s.image_occurrence
-    WHERE modality_concept_id IN (2128009197, 2128009189)
+    WHERE modality_concept_id IN (2128009197, 2128009189)  -- CXR modality 로컬 concept_id
  ),
  cxr_eligible AS (
    SELECT c.person_id, c.image_occurrence_id, c.image_study_uid, c.cxr_date
@@ -229,13 +243,13 @@ sql <- sprintf(
  qualifying_events AS (
    SELECT te.person_id, te.icu_transfer_date,
           ce.image_occurrence_id, ce.image_study_uid, ce.cxr_date,
-          ROW_NUMBER() OVER (
+          ROW_NUMBER() OVER (  -- 환자당 최초 qualifying 전원 1건
             PARTITION BY te.person_id ORDER BY te.icu_transfer_date
           ) AS event_seq
      FROM transfer_events te
      JOIN cxr_eligible ce
        ON ce.person_id = te.person_id
-      AND (te.icu_transfer_date - ce.cxr_date) = 1
+      AND (te.icu_transfer_date - ce.cxr_date) = 1  -- 익일 전원: 전원일 - CXR일 = 1 (calendar day 단위)
  ),
  positive_cohort AS (
    SELECT person_id, image_occurrence_id, image_study_uid,
@@ -244,6 +258,7 @@ sql <- sprintf(
     WHERE event_seq = 1
  ),
  negative_candidates AS (
+   -- 음성: 전원 사건 없는 환자의 최초 eligible CXR. 직접 ICU 입실 환자도 음성으로 간주 (의도)
    SELECT ce.person_id, ce.image_occurrence_id, ce.image_study_uid, ce.cxr_date,
           ROW_NUMBER() OVER (
             PARTITION BY ce.person_id ORDER BY ce.cxr_date
@@ -276,6 +291,7 @@ print(nrow(cohort_step1) == length(unique(cohort_step1$person_id)))  # person �
 library(dplyr)
 
 # ---------- 0. 변수 정의 ----------
+# lo/hi: 생리적 허용 범위 (입력 오류 제거용 plausibility filter)
 var_map_df <- tibble::tribble(
   ~concept_id, ~var_name,     ~lo,   ~hi,
   3000963L, "hgb",          2,     25,
@@ -298,10 +314,11 @@ var_map_df <- tibble::tribble(
   3037511L, "lymph_pct",    0,     100
 )
 
+# var_map을 SQL VALUES 리터럴 (concept_id,'var_name',lo,hi)로 변환
 vm_values <- paste0("(", var_map_df$concept_id, ",'", var_map_df$var_name, "',",
                     var_map_df$lo, ",", var_map_df$hi, ")", collapse = ",\n     ")
 
-# 동적 pivot 절 생성
+# 동적 pivot 절 생성: long → wide (변수값 + 변수별 lag_days)
 pivot_val <- paste0("MAX(CASE WHEN var_name='", var_map_df$var_name,
                     "' THEN val END) AS ", var_map_df$var_name, collapse = ",\n     ")
 pivot_lag <- paste0("MAX(CASE WHEN var_name='", var_map_df$var_name,
@@ -310,6 +327,7 @@ sel_cols <- paste0("mw.", c(var_map_df$var_name,
                             paste0(var_map_df$var_name, "_lag")), collapse = ", ")
 
 # ---------- 1. cohort_step1 인라인 ----------
+# cohort_step1을 VALUES로 SQL에 인라인 (temp table 미사용, 대규모 코호트 시 SQL 길이 증가)
 ck <- cohort_step1 %>% distinct(person_id, image_occurrence_id, index_cxr_date, outcome)
 stopifnot(!anyDuplicated(as.character(ck$person_id)))
 
@@ -333,6 +351,7 @@ sql_step2 <- sprintf(
    ) AS t(concept_id, var_name, lo, hi)
  ),
  meas_win AS (
+   -- index CXR일 기준 [D-7, D0] lab. D0 포함 → CXR 이후 채혈값 포함 가능
    SELECT co.person_id,
           vm.var_name,
           m.value_as_number AS val,
@@ -349,6 +368,7 @@ sql_step2 <- sprintf(
             BETWEEN (co.index_cxr_date - 7) AND co.index_cxr_date
  ),
  meas_latest AS (
+   -- DISTINCT ON (PostgreSQL 전용): person·변수별 최신값
    SELECT DISTINCT ON (person_id, var_name)
           person_id, var_name, val, lag_days
      FROM meas_win
@@ -363,7 +383,7 @@ sql_step2 <- sprintf(
  )
  SELECT
    co.person_id, co.image_occurrence_id, co.index_cxr_date, co.outcome,
-   (EXTRACT(YEAR FROM co.index_cxr_date) - p.year_of_birth) AS age,
+   (EXTRACT(YEAR FROM co.index_cxr_date) - p.year_of_birth) AS age,  -- 연도 차 근사
    p.gender_concept_id,
    gc.concept_name AS sex,
    io.image_study_uid,
@@ -413,4 +433,4 @@ write.csv(cohort_step2, out_csv, row.names = FALSE)
 
 cat("\n[완료] 코호트 저장 =>", out_csv, "\n")
 cat("코호트 미리보기:\n")
-print(head(cohort, 5))
+print(head(cohort_step2, 5))
